@@ -6,7 +6,8 @@ Async command line task runner with checkpointing, backoff, and retries.
 
 ```bash
 nix run github:nicolaschan/burndown --help
-echo -e 'a\nb\nc\nd\ne\nf\ng\nh' | nix run github:nicolaschan/burndown -- --cmd 'nix run github:nicolaschan/burndown#flakysnail'
+echo -e 'a\nb\nc\nd\ne\nf\ng\nh' \
+  | nix run github:nicolaschan/burndown -- --cmd 'nix run github:nicolaschan/burndown#flakysnail'
 ```
 
 ## Features
