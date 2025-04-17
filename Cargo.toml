@@ -1,0 +1,19 @@
+[package]
+name = "burndown"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+backoff = { version = "0.4.0", features = ["futures", "tokio"] }
+chrono = { version = "0.4.40", features = ["serde"] }
+clap = { version = "4.5.36", features = ["derive"] }
+env_logger = "0.11.8"
+futures = "0.3.31"
+indicatif = { version = "0.17.11", features = ["improved_unicode", "tokio", "vt100"] }
+log = "0.4.27"
+num_cpus = "1.16.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+shell-words = "1.1.0"
+tokio = { version = "1.44.2", features = ["full"] }

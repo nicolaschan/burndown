@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+# flakysnail - a script that randomly fails and takes 5-10 seconds to run
+
+# Generate a random sleep time between 5 and 10 seconds
+sleep_time=$(awk -v min=1 -v max=5 'BEGIN{srand(); print min+rand()*(max-min)}')
+
+# Generate a random number between 1 and 10
+random_number=$(( RANDOM % 10 + 1 ))
+
+echo -n "Working... please wait... "
+sleep "$sleep_time"
+
+# Fail approximately 70% of the time (if random_number is 1, 2, or 3)
+if [ $random_number -le 7 ]; then
+  echo "Error: The snail got stuck! 🐚" >&2
+  exit 1
+else
+  echo "Success: The snail reached its destination. 🐌"
+  exit 0
+fi
