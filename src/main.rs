@@ -1,7 +1,7 @@
 use backoff::{ExponentialBackoffBuilder, backoff::Backoff};
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io::BufRead, process::Stdio, time::Duration};
+use std::{collections::HashMap, io::BufRead, process::Stdio, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -10,7 +10,8 @@ use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
-    sync::Mutex,
+    sync::{Mutex, mpsc::error::TryRecvError},
+    task::JoinHandle,
     time::Instant,
 };
 
@@ -45,6 +46,7 @@ trait Checkpoint {
     async fn contains_key(&self, key: &str) -> bool;
     async fn get(&self, key: &str) -> Option<CheckpointEntry>;
     async fn insert(&self, key: String, value: CheckpointEntry);
+    async fn finish(self);
 }
 
 enum CheckpointType {
@@ -53,18 +55,62 @@ enum CheckpointType {
 }
 
 struct CheckpointFile {
-    file: Mutex<File>,
-    contents: Mutex<CheckpointContents>,
+    sender: tokio::sync::mpsc::UnboundedSender<(String, CheckpointEntry)>,
+    contents: Arc<Mutex<CheckpointContents>>,
+    handle: JoinHandle<()>,
+}
+
+async fn write_contents(file: &mut File, contents: &Arc<Mutex<CheckpointContents>>) {
+    let serialized = {
+        let contents_guard = contents.lock().await;
+        serde_json::to_string_pretty(&*contents_guard).unwrap()
+    };
+    file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+    file.set_len(0).await.unwrap();
+    if let Err(e) = file.write_all(serialized.as_bytes()).await {
+        eprintln!("Failed to write to checkpoint file: {}", e);
+    }
 }
 
 impl CheckpointFile {
     async fn new(mut file: File) -> Result<Self> {
         let mut file_contents = String::new();
         file.read_to_string(&mut file_contents).await?;
-        let contents = serde_json::from_str(&file_contents).unwrap_or_default();
+        let contents: CheckpointContents = serde_json::from_str(&file_contents).unwrap_or_default();
+        let contents = Arc::new(Mutex::new(contents));
+
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::unbounded_channel::<(String, CheckpointEntry)>();
+        let contents_clone = contents.clone();
+        let handle = tokio::spawn(async move {
+            let mut changed = false;
+            loop {
+                match receiver.try_recv() {
+                    Ok((key, value)) => {
+                        let mut contents_guard = contents_clone.lock().await;
+                        contents_guard.0.insert(key.clone(), value);
+                        changed = true;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        if changed {
+                            write_contents(&mut file, &contents_clone).await;
+                        }
+                        changed = false;
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        if changed {
+                            write_contents(&mut file, &contents_clone).await;
+                        }
+                        break;
+                    }
+                }
+            }
+        });
         Ok(CheckpointFile {
-            file: Mutex::new(file),
-            contents: Mutex::new(contents),
+            sender,
+            contents,
+            handle,
         })
     }
 
@@ -92,15 +138,12 @@ impl Checkpoint for CheckpointFile {
     }
 
     async fn insert(&self, key: String, value: CheckpointEntry) {
-        let mut file = self.file.lock().await;
-        let mut contents = self.contents.lock().await;
-        contents.0.insert(key, value);
-        let serialized = serde_json::to_string_pretty(&*contents).unwrap();
-        file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
-        file.set_len(0).await.unwrap();
-        if let Err(e) = file.write_all(serialized.as_bytes()).await {
-            eprintln!("Failed to write to checkpoint file: {}", e);
-        }
+        self.sender.send((key, value)).unwrap();
+    }
+
+    async fn finish(self) {
+        drop(self.sender);
+        self.handle.await.unwrap();
     }
 }
 
@@ -123,6 +166,13 @@ impl Checkpoint for CheckpointType {
         match self {
             CheckpointType::Null => {}
             CheckpointType::File(file) => file.insert(key, value).await,
+        }
+    }
+
+    async fn finish(self) {
+        match self {
+            CheckpointType::Null => {}
+            CheckpointType::File(file) => file.finish().await,
         }
     }
 }
@@ -176,6 +226,8 @@ async fn main() -> Result<()> {
 
     progress.finish_and_clear();
     multiprogress.clear()?;
+
+    checkpoint.finish().await;
     Ok(())
 }
 
