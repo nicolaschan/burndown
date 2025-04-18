@@ -10,7 +10,11 @@ use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
-    sync::{Mutex, mpsc::error::TryRecvError},
+    signal::unix::{SignalKind, signal},
+    sync::{
+        Mutex,
+        mpsc::{UnboundedSender, error::TryRecvError, unbounded_channel},
+    },
     task::JoinHandle,
     time::Instant,
 };
@@ -55,12 +59,19 @@ enum CheckpointType {
 }
 
 struct CheckpointFile {
-    sender: tokio::sync::mpsc::UnboundedSender<(String, CheckpointEntry)>,
+    sender: UnboundedSender<(String, CheckpointEntry)>,
     contents: Arc<Mutex<CheckpointContents>>,
     handle: JoinHandle<()>,
 }
 
-async fn write_contents(file: &mut File, contents: &Arc<Mutex<CheckpointContents>>) {
+async fn write_contents_if_changed(
+    changed: bool,
+    file: &mut File,
+    contents: &Arc<Mutex<CheckpointContents>>,
+) {
+    if !changed {
+        return;
+    }
     let serialized = {
         let contents_guard = contents.lock().await;
         serde_json::to_string_pretty(&*contents_guard).unwrap()
@@ -79,8 +90,7 @@ impl CheckpointFile {
         let contents: CheckpointContents = serde_json::from_str(&file_contents).unwrap_or_default();
         let contents = Arc::new(Mutex::new(contents));
 
-        let (sender, mut receiver) =
-            tokio::sync::mpsc::unbounded_channel::<(String, CheckpointEntry)>();
+        let (sender, mut receiver) = unbounded_channel::<(String, CheckpointEntry)>();
         let contents_clone = contents.clone();
         let handle = tokio::spawn(async move {
             let mut changed = false;
@@ -92,16 +102,12 @@ impl CheckpointFile {
                         changed = true;
                     }
                     Err(TryRecvError::Empty) => {
-                        if changed {
-                            write_contents(&mut file, &contents_clone).await;
-                        }
+                        write_contents_if_changed(changed, &mut file, &contents_clone).await;
                         changed = false;
                         continue;
                     }
                     Err(TryRecvError::Disconnected) => {
-                        if changed {
-                            write_contents(&mut file, &contents_clone).await;
-                        }
+                        write_contents_if_changed(changed, &mut file, &contents_clone).await;
                         break;
                     }
                 }
@@ -181,8 +187,8 @@ impl Checkpoint for CheckpointType {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let concurrency = args.concurrency.unwrap_or(num_cpus::get());
-    let checkpoint = get_checkpoint(args.checkpoint).await;
     let backoff = get_backoff(args.max_backoff_ms);
+    let checkpoint = get_checkpoint(args.checkpoint).await;
 
     let multiprogress = MultiProgress::new();
 
@@ -219,15 +225,21 @@ async fn main() -> Result<()> {
         multiprogress.println(result).unwrap();
         progress.inc(1);
     });
-    let _ = stream::iter(futures)
-        .buffer_unordered(concurrency)
-        .collect::<Vec<_>>()
-        .await;
 
+    let futures = stream::iter(futures)
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>();
+
+    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+    tokio::select! {
+        _ = futures => {}
+        _ = sigint.recv() => {}
+    }
+
+    checkpoint.finish().await;
     progress.finish_and_clear();
     multiprogress.clear()?;
 
-    checkpoint.finish().await;
     Ok(())
 }
 
